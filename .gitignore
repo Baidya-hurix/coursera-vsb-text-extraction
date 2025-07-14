@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Environment variables
+.env
+
+# Virtual environments
+.venv
+
+# Local files
+files/
+
+# User credentials and authentication
+USER_CREDENTIALS.md
+.streamlit/secrets.toml
+*_CREDENTIALS.md
+credentials.json
+auth_config.json
+
+notebooks/
