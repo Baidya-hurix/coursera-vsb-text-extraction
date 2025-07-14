@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info
 
+# Package configuration (use requirements.txt instead)
+pyproject.toml
+
 # Environment variables
 .env
 
