@@ -8,6 +8,7 @@ wheels/
 
 # Package configuration (use requirements.txt instead)
 pyproject.toml
+uv.lock
 
 # Environment variables
 .env
