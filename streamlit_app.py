@@ -1,16 +1,15 @@
-import streamlit as st
-import pandas as pd
-import json
-import uuid
-import boto3
 import os
 import time
-from io import BytesIO
-from typing import List, Dict, Any, Optional, Tuple
-import streamlit_authenticator as stauth
+import uuid
+import ftfy
+import json
+import boto3
 import traceback
-from docx import Document
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+import pandas as pd
+import streamlit as st
+from io import BytesIO
+import streamlit_authenticator as stauth
+from typing import List, Dict, Any, Optional, Tuple
 
 from src.logging_config import get_logger
 
@@ -192,12 +191,46 @@ def check_authentication():
     return False
 
 def read_excel_from_upload(uploaded_file, sheet_name: str = "Outline") -> Optional[pd.DataFrame]:
-    """Read Excel file from Streamlit upload."""
+    """Read Excel file from Streamlit upload with proper encoding handling."""
     try:
         logger.info(f"Reading Excel file: {uploaded_file.name}, sheet: {sheet_name}")
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
-        logger.info(f"Successfully read Excel file with {len(df)} rows")
-        return df
+        
+        # Try multiple approaches to handle encoding issues
+        df = None
+        
+        # Method 1: Try with openpyxl engine and specific encoding handling
+        try:
+            df = pd.read_excel(
+                uploaded_file, 
+                sheet_name=sheet_name, 
+                header=None,
+                engine='openpyxl',
+                dtype=str  # Read all as strings to preserve encoding
+            )
+            logger.info("Successfully read Excel with openpyxl engine")
+        except Exception as e1:
+            logger.warning(f"Method 1 failed: {e1}")
+            
+            # Method 2: Reset file pointer and try with default settings
+            try:
+                uploaded_file.seek(0)
+                df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None, dtype=str)
+                logger.info("Successfully read Excel with default method")
+            except Exception as e2:
+                logger.warning(f"Method 2 failed: {e2}")
+                raise e2
+        
+        if df is not None:
+            # Apply encoding fixes to all string cells in the dataframe
+            logger.info("Applying encoding fixes to dataframe")
+            for col in df.columns:
+                df[col] = df[col].apply(lambda x: clean_text_encoding(str(x)) if pd.notna(x) else x)
+            
+            logger.info(f"Successfully read and cleaned Excel file with {len(df)} rows")
+            return df
+        else:
+            raise ValueError("Failed to read Excel file with any method")
+            
     except Exception as e:
         logger.error(f"Error reading Excel file {uploaded_file.name}: {e}")
         st.error(f"Error reading Excel file: {e}")
@@ -234,9 +267,9 @@ def extract_video_data(lesson_df: pd.DataFrame) -> List[Tuple[str, str]]:
     """Extract video data (title and voiceover) from a lesson DataFrame."""
     try:
         video_data = []
-        video_rows = lesson_df[
-            lesson_df[0].astype(str).str.strip().str.lower().str.startswith("video")
-        ]
+        # Look for rows starting with "video" or "introductory video"
+        video_mask = lesson_df[0].astype(str).str.strip().str.lower().str.startswith(("video", "introductory video"))
+        video_rows = lesson_df[video_mask]
         
         if video_rows.empty:
             return video_data
@@ -271,7 +304,7 @@ def find_lesson_count(df: pd.DataFrame) -> int:
         st.error(f"Error counting lessons: {e}")
         return 0
 
-def upload_to_s3(file_content: bytes, s3_key: str, content_type: str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document") -> bool:
+def upload_to_s3(file_content: bytes, s3_key: str, content_type: str = "text/plain") -> bool:
     """Upload file content to S3."""
     try:
         logger.info(f"Uploading file to S3: {s3_key}")
@@ -280,7 +313,8 @@ def upload_to_s3(file_content: bytes, s3_key: str, content_type: str = "applicat
             Bucket=S3_BUCKET_NAME,
             Key=s3_key,
             Body=file_content,
-            ContentType=content_type
+            ContentType=content_type,
+            ContentDisposition=f'attachment; filename="{os.path.basename(s3_key)}"'
         )
         logger.info(f"Successfully uploaded file to S3: {s3_key}")
         return True
@@ -293,37 +327,40 @@ def get_s3_url(s3_key: str) -> str:
     """Get public S3 URL for a key."""
     return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
 
-def create_video_docx(lesson_num: int, video_num: int, video_title: str, voiceover: str, course_id: str) -> BytesIO:
-    """Create a DOCX file for a single video description."""
+
+def clean_text_encoding(text: str) -> str:
+    """
+    Use ftfy to repair mojibake while preserving newlines.
+    """
+    if not text or pd.isna(text):
+        return ""
+    # ftfy fixes the common mis-encodings automatically
+    cleaned = ftfy.fix_text(str(text), normalization="NFC").replace("—", "-")
+    # Trim trailing spaces but keep paragraph structure
+    return "\n".join(line.rstrip() for line in cleaned.splitlines())
+
+def create_video_txt(lesson_num: int, video_num: int, video_title: str, voiceover: str, course_id: str) -> BytesIO:
+    """Create a TXT file for a single video description."""
     try:
-        logger.info(f"Creating DOCX for Lesson {lesson_num}, Video {video_num}: {video_title}")
-        # Create a new document
-        doc = Document()
+        logger.info(f"Creating TXT for Lesson {lesson_num}, Video {video_num}: {video_title}")
         
-        # Add title
-        title = doc.add_heading(f'Lesson {lesson_num} - Video {video_num}: {video_title}', 0)
-        title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        
-        # Add line break
-        doc.add_paragraph()
-        
-        # Video description header
-        desc_header = doc.add_heading('Video Description:', level=1)
-        
-        # Video description content
-        desc_content = doc.add_paragraph(voiceover)
-        desc_content.style = 'Normal'
+        # Create text content (text is already cleaned at Excel reading stage)
+        content = f"Lesson {lesson_num} - Video {video_num}: {video_title}\n"
+        content += "=" * len(f"Lesson {lesson_num} - Video {video_num}: {video_title}") + "\n\n"
+        content += "Video Description:\n"
+        content += "-" * 18 + "\n"
+        content += voiceover + "\n"
         
         # Save to BytesIO buffer
         buffer = BytesIO()
-        doc.save(buffer)
+        buffer.write(content.encode('utf-8'))
         buffer.seek(0)
-        logger.info(f"Successfully created DOCX for Lesson {lesson_num}, Video {video_num}")
+        logger.info(f"Successfully created TXT for Lesson {lesson_num}, Video {video_num}")
         return buffer
         
     except Exception as e:
-        logger.error(f"Error creating DOCX file for Lesson {lesson_num}, Video {video_num}: {e}")
-        st.error(f"Error creating DOCX file: {e}")
+        logger.error(f"Error creating TXT file for Lesson {lesson_num}, Video {video_num}: {e}")
+        st.error(f"Error creating TXT file: {e}")
         raise
 
 
@@ -363,25 +400,25 @@ def process_course_outline(df: pd.DataFrame, course_id: str) -> Dict[str, Any]:
                         "voiceover": voiceover
                     })
                     
-                    # Create DOCX file for this individual video
-                    docx_buffer = create_video_docx(lesson_num, idx, title, voiceover, course_id)
+                    # Create TXT file for this individual video
+                    txt_buffer = create_video_txt(lesson_num, idx, title, voiceover, course_id)
                     # Clean filename by removing special characters
                     clean_title = ''.join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
                     clean_title = clean_title.replace(' ', '_')[:50]  # Limit length and replace spaces
-                    s3_key = f"video_descriptions/{course_id}/lesson_{lesson_num}_video_{idx}_{clean_title}.docx"
+                    s3_key = f"video_descriptions/{course_id}/lesson_{lesson_num}_video_{idx}_{clean_title}.txt"
                     
-                    if upload_to_s3(docx_buffer.getvalue(), s3_key):
+                    if upload_to_s3(txt_buffer.getvalue(), s3_key):
                         s3_files.append({
                             "lesson": lesson_num,
                             "video": idx,
                             "title": title,
                             "s3_key": s3_key,
                             "s3_url": get_s3_url(s3_key),
-                            "file_type": "docx"
+                            "file_type": "txt"
                         })
                     
                     # Clean up buffer
-                    docx_buffer.close()
+                    txt_buffer.close()
         
         # Create course metadata for return
         course_summary = {
@@ -395,7 +432,7 @@ def process_course_outline(df: pd.DataFrame, course_id: str) -> Dict[str, Any]:
         logger.info(f"Course processing completed successfully: {len(all_video_data)} videos processed, {len(s3_files)} files uploaded")
         return {
             "status": "success",
-            "message": f"Successfully extracted {len(all_video_data)} video descriptions and created individual DOCX files",
+            "message": f"Successfully extracted {len(all_video_data)} video descriptions and created individual TXT files",
             "total_lessons": num_lessons,
             "total_videos": len(all_video_data),
             "s3_files": s3_files,
@@ -488,7 +525,7 @@ def main():
                             ✅ Successfully extracted video descriptions!<br>
                             📊 Total Lessons: {result['total_lessons']}<br>
                             🎥 Total Videos: {result['total_videos']}<br>
-                            📄 DOCX Files created: {len(result['s3_files'])}
+                            📄 TXT Files created: {len(result['s3_files'])}
                         </div>
                         """, unsafe_allow_html=True)
                         
@@ -516,10 +553,10 @@ def main():
             st.metric("S3 Files", len(result['s3_files']))
         
         # Display S3 files
-        st.subheader("📄 Generated DOCX Files")
+        st.subheader("📄 Generated TXT Files")
         
         for file_info in result['s3_files']:
-            st.write(f"📝 **Lesson {file_info['lesson']} - Video {file_info['video']}**: {file_info['title']} - [Download DOCX]({file_info['s3_url']})")
+            st.write(f"📝 **Lesson {file_info['lesson']} - Video {file_info['video']}**: {file_info['title']} - [Download TXT]({file_info['s3_url']})")
         
         # Display sample data
         if st.checkbox("👀 Show Sample Data"):
@@ -532,17 +569,17 @@ def main():
     1. **Upload** your course outline Excel file (.xlsx format)
     2. **Specify** the sheet name (default: "Outline")
     3. **Click** "Extract Video Descriptions" to process the file
-    4. **Download** individual DOCX files from S3 links
+    4. **Download** individual TXT files from S3 links
     
     **Excel Format Requirements:**
     - Column A: Should contain "Lesson 1", "Lesson 2", etc. headers
-    - Under each lesson, rows starting with "Video" in Column A
+    - Under each lesson, rows starting with "Video" or "Introductory Video" in Column A
     - Column B: Video titles
     - Column D: Voiceover scripts
     
     **Output Format:**
-    - Individual DOCX files saved to S3 bucket
-    - One DOCX file per video
+    - Individual TXT files saved to S3 bucket
+    - One TXT file per video
     - Clean video descriptions without metadata
     - Ready for sharing and editing
     """)
